@@ -4,6 +4,7 @@ import { buildFullEvalPrompt, buildFormContext } from '@/lib/prompts/evaluator';
 import { weightedScore, deriveRecommendation, scoreLabel, scaleToScore } from '@/lib/scoring';
 import { RUBRICS, computeQuestionScore } from '@/lib/rubrics';
 import { scriptWrite } from '@/lib/eval-script-write';
+import { kvGet, kvSet } from '@/lib/kv';
 import type { CandidateProfile } from '@/lib/types';
 
 interface AnswerInput {
@@ -41,38 +42,28 @@ interface EvalResult {
   evaluated_at: string;
 }
 
-declare global { var _evaluations: Map<string, EvalResult> | undefined }
-const evaluations: Map<string, EvalResult> = global._evaluations ?? (global._evaluations = new Map());
-
 const SECTION_WEIGHTS: Record<number, number> = {
   1: 0.20, 2: 0.30, 3: 0.25, 4: 0.25,
 };
+void SECTION_WEIGHTS;
 
-// ── Enforcement server-side de respuestas mínimas ─────────────────────────────
-// Corre DESPUÉS de Groq — garantiza que una letra suelta = 0 sin importar qué diga la IA.
 function enforceLengthPenalty(answer: string, dims: DimScores): DimScores {
   const trimmed = answer.trim();
   const wordCount = trimmed.split(/\s+/).filter(w => w.length > 0).length;
   const charCount = trimmed.length;
 
   if (charCount === 0 || charCount <= 3 || wordCount <= 2) {
-    // Respuesta vacía, una letra o una palabra sola → todo 0
     return Object.fromEntries(Object.keys(dims).map(k => [k, 0]));
   }
   if (wordCount < 20) {
-    // Muy corta → cap 0.08 por dimensión (score máx ~8)
     return Object.fromEntries(Object.entries(dims).map(([k, v]) => [k, Math.min(v, 0.08)]));
   }
   if (wordCount < 40) {
-    // Corta → cap 0.25 por dimensión (score máx ~25)
     return Object.fromEntries(Object.entries(dims).map(([k, v]) => [k, Math.min(v, 0.25)]));
   }
   return dims;
 }
 
-// ── Override de salida cualitativa de Groq para scores muy bajos ──────────────
-// Groq redacta sus respuestas ANTES de que calculemos los scores reales.
-// Si el score calculado es objetivamente bajo, limpiamos lo que Groq haya dicho.
 function overrideGroqOutput(result: EvalResult): EvalResult {
   if (result.total_score >= 15) return result;
 
@@ -96,7 +87,6 @@ function overrideGroqOutput(result: EvalResult): EvalResult {
   };
 }
 
-// ── Guardar evaluación en Sheets ──────────────────────────────────────────────
 async function saveEvaluationToSheets(
   code: string, candidateName: string, profile: string, result: EvalResult
 ) {
@@ -121,7 +111,6 @@ async function saveEvaluationToSheets(
   });
 }
 
-// ── POST /api/evaluate ────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   const body = await req.json();
   const { code, candidateName, profile, answers, applicantData } = body as {
@@ -156,7 +145,6 @@ export async function POST(req: NextRequest) {
     const groqQuestions: Record<string, DimScores> = parsed.questions ?? {};
     const sectionSummaries: Record<string, string> = parsed.section_summaries ?? {};
 
-    // Construir resultados por sección
     const sectionMap: Record<number, QuestionResult[]> = { 1: [], 2: [], 3: [], 4: [] };
 
     for (const ans of answers) {
@@ -172,7 +160,6 @@ export async function POST(req: NextRequest) {
         const rawDims = Object.fromEntries(
           Object.entries(groqDims).filter(([k]) => !k.startsWith('_'))
         );
-        // Enforcement estricto: ignora lo que dijo Groq para respuestas muy cortas
         dimensions = enforceLengthPenalty(answer, rawDims);
         score = RUBRICS[questionId]
           ? computeQuestionScore(questionId, dimensions)
@@ -185,7 +172,6 @@ export async function POST(req: NextRequest) {
       sectionMap[section]?.push({ questionId, question, answer, dimensions, score });
     }
 
-    // Score por sección = promedio de preguntas
     const sectionEvals: { section: number; score: number }[] = [];
     const sectionsOutput: EvalResult['sections'] = {};
 
@@ -227,12 +213,10 @@ export async function POST(req: NextRequest) {
       evaluated_at: new Date().toISOString(),
     };
 
-    // Sobreescribir salida cualitativa de Groq si el score es objetivamente inválido
     result = overrideGroqOutput(result);
 
-    evaluations.set(code.toUpperCase(), result);
+    await kvSet(`eval:${code.toUpperCase()}`, result, 7 * 86400);
 
-    // Guardar en Sheets en background
     saveEvaluationToSheets(code, candidateName, profile, result).catch(err =>
       console.error('[evaluate] Error guardando en Sheets:', err)
     );
@@ -245,12 +229,11 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// ── GET /api/evaluate?code=XXXX ───────────────────────────────────────────────
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get('code')?.toUpperCase().trim() ?? '';
   if (!code) return NextResponse.json({ error: 'Código requerido.' }, { status: 400 });
 
-  const result = evaluations.get(code);
+  const result = await kvGet<EvalResult>(`eval:${code}`);
   if (!result) return NextResponse.json({ ready: false });
 
   return NextResponse.json({ ready: true, result });

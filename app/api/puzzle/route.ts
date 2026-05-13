@@ -1,38 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scriptWrite } from '@/lib/eval-script-write';
+import { kvGet, kvSet } from '@/lib/kv';
 
-declare global {
-  var _puzzleStates: Map<string, PuzzleState> | undefined;
-}
-
+// State stored in KV — no images (stored separately as puzzle:CODE:img:easy/normal/hard)
 interface PuzzleState {
   status: 'idle' | 'ready' | 'round_active' | 'between_rounds' | 'completed' | 'timeout';
-  easyImage:   string | null;   // round 0 — 3×3
-  normalImage: string | null;   // round 1 — 6×6
-  hardImage:   string | null;   // round 2 — 12×12
+  hasImages: boolean;
   currentRound:        0 | 1 | 2;
-  elapsedSec:          number;   // cumulative active play time (pauses excluded)
-  roundStartTime:      number | null;   // wall-clock ms when current round began
-  betweenRoundsUntil:  number | null;   // wall-clock ms when 40s pause ends
+  elapsedSec:          number;
+  roundStartTime:      number | null;
+  betweenRoundsUntil:  number | null;
   completedRounds:     number;
-  progressPct:         number;    // 0-100: pieces placed in the current active round
-  roundTimings:        number[];  // seconds taken per completed round
+  progressPct:         number;
+  roundTimings:        number[];
 }
 
 const DIFFICULTIES   = [3, 6, 12] as const;
 const ROUND_LABELS   = ['Fácil 3×3', 'Normal 6×6', 'Difícil 12×12'];
+const IMG_KEYS       = ['easy', 'normal', 'hard'] as const;
 const PAUSE_SECS     = 40;
 const TIME_LIMIT_SEC = 600;
-
-function store(): Map<string, PuzzleState> {
-  if (!global._puzzleStates) global._puzzleStates = new Map();
-  return global._puzzleStates;
-}
+const STATE_TTL      = 86400;    // 24h
+const IMG_TTL        = 86400;    // 24h
 
 function blank(): PuzzleState {
   return {
     status: 'idle',
-    easyImage: null, normalImage: null, hardImage: null,
+    hasImages: false,
     currentRound: 0, elapsedSec: 0,
     roundStartTime: null, betweenRoundsUntil: null,
     completedRounds: 0,
@@ -47,25 +41,23 @@ function liveElapsed(state: PuzzleState, now = Date.now()): number {
   return state.elapsedSec;
 }
 
-function imageForRound(state: PuzzleState, round: 0 | 1 | 2): string | null {
-  return [state.easyImage, state.normalImage, state.hardImage][round];
-}
+function stateKey(code: string) { return `puzzle:${code}`; }
+function imgKey(code: string, slot: typeof IMG_KEYS[number]) { return `puzzle:${code}:img:${slot}`; }
 
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get('code')?.toUpperCase().trim();
   if (!code) return NextResponse.json({ error: 'code required' }, { status: 400 });
 
-  const s     = store();
-  const state = s.get(code) ?? blank();
-  const now   = Date.now();
+  let state = (await kvGet<PuzzleState>(stateKey(code))) ?? blank();
+  const now = Date.now();
+  let dirty = false;
 
   // Auto-timeout
   if (state.status === 'round_active' && liveElapsed(state, now) > TIME_LIMIT_SEC) {
-    state.elapsedSec    = liveElapsed(state, now);
+    state.elapsedSec     = liveElapsed(state, now);
     state.roundStartTime = null;
-    state.status        = 'timeout';
-    s.set(code, state);
-    // Persist to Sheets in background
+    state.status         = 'timeout';
+    dirty = true;
     scriptWrite({
       action: 'savePuzzleResult', code,
       status: 'timeout',
@@ -78,14 +70,18 @@ export async function GET(req: NextRequest) {
 
   // Auto-advance after 40s pause
   if (state.status === 'between_rounds' && state.betweenRoundsUntil && now >= state.betweenRoundsUntil) {
-    state.currentRound        = (state.currentRound + 1) as 0 | 1 | 2;
-    state.roundStartTime      = now;
-    state.betweenRoundsUntil  = null;
-    state.status              = 'round_active';
-    s.set(code, state);
+    state.currentRound       = (state.currentRound + 1) as 0 | 1 | 2;
+    state.roundStartTime     = now;
+    state.betweenRoundsUntil = null;
+    state.status             = 'round_active';
+    dirty = true;
   }
 
-  const elapsed         = Math.floor(liveElapsed(state, now));
+  if (dirty) {
+    await kvSet(stateKey(code), state, STATE_TTL);
+  }
+
+  const elapsed          = Math.floor(liveElapsed(state, now));
   const betweenCountdown = state.betweenRoundsUntil
     ? Math.max(0, Math.ceil((state.betweenRoundsUntil - now) / 1000))
     : null;
@@ -96,7 +92,7 @@ export async function GET(req: NextRequest) {
     difficulty:            DIFFICULTIES[state.currentRound],
     roundLabel:            ROUND_LABELS[state.currentRound],
     elapsedSec:            elapsed,
-    previousRoundsElapsed: Math.floor(state.elapsedSec), // stable during active round
+    previousRoundsElapsed: Math.floor(state.elapsedSec),
     timeLimitSec:          TIME_LIMIT_SEC,
     completedRounds:       state.completedRounds,
     betweenCountdown,
@@ -105,9 +101,9 @@ export async function GET(req: NextRequest) {
     roundTimings:          state.roundTimings,
   };
 
-  // Only deliver imageData while the candidate is actively playing
+  // Deliver image only while candidate is actively playing
   if (state.status === 'round_active') {
-    resp.imageData = imageForRound(state, state.currentRound);
+    resp.imageData = await kvGet<string>(imgKey(code, IMG_KEYS[state.currentRound]));
   }
 
   return NextResponse.json(resp);
@@ -118,24 +114,29 @@ export async function POST(req: NextRequest) {
   const { code, action } = body;
   if (!code || !action) return NextResponse.json({ error: 'missing fields' }, { status: 400 });
 
-  const s     = store();
-  const state = s.get(code) ?? blank();
-  const now   = Date.now();
+  const upperCode = (code as string).toUpperCase().trim();
+  let state = (await kvGet<PuzzleState>(stateKey(upperCode))) ?? blank();
+  const now = Date.now();
 
   switch (action) {
-    case 'setup':
-      state.easyImage   = body.easyImage   ?? null;
-      state.normalImage = body.normalImage ?? null;
-      state.hardImage   = body.hardImage   ?? null;
-      state.currentRound       = 0;
-      state.elapsedSec         = 0;
-      state.roundStartTime     = null;
-      state.betweenRoundsUntil = null;
-      state.completedRounds    = 0;
-      state.progressPct        = 0;
-      state.roundTimings       = [];
-      state.status = (state.easyImage && state.normalImage && state.hardImage) ? 'ready' : 'idle';
+    case 'setup': {
+      // Store images as separate keys to keep main state small
+      const imgs: [string, string | null][] = [
+        [imgKey(upperCode, 'easy'),   body.easyImage   ?? null],
+        [imgKey(upperCode, 'normal'), body.normalImage ?? null],
+        [imgKey(upperCode, 'hard'),   body.hardImage   ?? null],
+      ];
+      await Promise.all(
+        imgs.map(([k, v]) => v ? kvSet(k, v, IMG_TTL) : Promise.resolve())
+      );
+      const hasImages = !!(body.easyImage && body.normalImage && body.hardImage);
+      state = {
+        ...blank(),
+        hasImages,
+        status: hasImages ? 'ready' : 'idle',
+      };
       break;
+    }
 
     case 'start':
       if (state.status === 'ready') {
@@ -155,13 +156,12 @@ export async function POST(req: NextRequest) {
         state.roundStartTime = null;
       }
       state.roundTimings.push(roundSec);
-      state.progressPct = 0; // reset for next round
+      state.progressPct = 0;
       state.completedRounds++;
       if (state.completedRounds >= 3) {
         state.status = 'completed';
-        // Persist to Sheets in background
         scriptWrite({
-          action: 'savePuzzleResult', code,
+          action: 'savePuzzleResult', code: upperCode,
           status: 'completed',
           completedRounds: state.completedRounds,
           elapsedSec: Math.floor(state.elapsedSec),
@@ -182,7 +182,7 @@ export async function POST(req: NextRequest) {
       break;
 
     case 'reset':
-      state.status             = (state.easyImage && state.normalImage && state.hardImage) ? 'ready' : 'idle';
+      state.status             = state.hasImages ? 'ready' : 'idle';
       state.currentRound       = 0;
       state.elapsedSec         = 0;
       state.roundStartTime     = null;
@@ -196,10 +196,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'unknown action' }, { status: 400 });
   }
 
-  s.set(code, state);
+  await kvSet(stateKey(upperCode), state, STATE_TTL);
+
   return NextResponse.json({
-    ok:        true,
-    status:    state.status,
+    ok:         true,
+    status:     state.status,
     elapsedSec: Math.floor(liveElapsed(state, now)),
   });
 }

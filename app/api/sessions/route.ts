@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scriptWrite } from '@/lib/eval-script-write';
+import { kvGet, kvSet } from '@/lib/kv';
 import type { CandidateProfile } from '@/lib/types';
 
 interface SessionEntry {
@@ -9,9 +10,6 @@ interface SessionEntry {
   documento: string;
   createdAt: number;
 }
-
-declare global { var _sessions: Map<string, SessionEntry> | undefined }
-const sessions: Map<string, SessionEntry> = global._sessions ?? (global._sessions = new Map());
 
 function generateCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -33,16 +31,15 @@ export async function POST(req: NextRequest) {
   }
 
   let code = generateCode();
-  let attempts = 0;
-  while (sessions.has(code) && attempts < 20) {
+  for (let i = 0; i < 20; i++) {
+    const existing = await kvGet(`session:${code}`);
+    if (!existing) break;
     code = generateCode();
-    attempts++;
   }
 
   const entry: SessionEntry = { code, profile, candidateName, documento, createdAt: Date.now() };
-  sessions.set(code, entry);
+  await kvSet(`session:${code}`, entry, 86400);
 
-  // Persistir en Sheets en background (GET+payload)
   scriptWrite({ action: 'createSession', code, profile, candidateName, documento })
     .then(r => { if (!r.ok) console.warn('[sessions POST] Sheets write falló:', r.error); })
     .catch(() => {});
@@ -54,7 +51,7 @@ export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get('code')?.toUpperCase().trim() ?? '';
   if (!code) return NextResponse.json({ error: 'Código requerido.' }, { status: 400 });
 
-  const session = sessions.get(code);
+  const session = await kvGet<SessionEntry>(`session:${code}`);
   if (!session) return NextResponse.json({ error: 'Código inválido o sesión no encontrada.' }, { status: 404 });
 
   return NextResponse.json({
